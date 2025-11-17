@@ -57,6 +57,9 @@ def train_one_epoch(model: torch.nn.Module,
             bt_loss = out_dict.get("bt_loss", None)
             cls_feats = out_dict["cls_feats"]
             outputs = out_dict["outputs"]
+            
+            on_diag = out_dict.get("on_diag", None)
+            off_diag = out_dict.get("off_diag", None)
 
             if args.reg == 'none':
                 loss_reg = torch.zeros_like(loss_mae)
@@ -73,6 +76,8 @@ def train_one_epoch(model: torch.nn.Module,
         loss_bt_value = bt_loss.item() if bt_loss is not None else 0.0
         loss_value = loss.item()
         train_acc = (outputs.argmax(dim=1) == targets).float().mean()
+        on_diag_value = on_diag.item() if on_diag is not None else 0.0
+        off_diag_value = off_diag.item() if off_diag is not None else 0.0
 
 
         loss /= accum_iter
@@ -90,6 +95,10 @@ def train_one_epoch(model: torch.nn.Module,
         metric_logger.update(train_acc=train_acc)
         if bt_loss is not None:
             metric_logger.update(loss_bt=loss_bt_value)
+        if on_diag is not None:
+            metric_logger.update(on_diag=on_diag_value)
+        if off_diag is not None:
+            metric_logger.update(off_diag=off_diag_value)
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
@@ -100,6 +109,8 @@ def train_one_epoch(model: torch.nn.Module,
         loss_ce_value_reduce = misc.all_reduce_mean(loss_ce_value)
         loss_bt_value_reduce = misc.all_reduce_mean(loss_bt_value)
         train_acc_reduce = misc.all_reduce_mean(train_acc)
+        on_diag_value_reduce = misc.all_reduce_mean(on_diag_value)
+        off_diag_value_reduce = misc.all_reduce_mean(off_diag_value)
 
         if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
             """ We use epoch_1000x as the x-axis in tensorboard.
@@ -113,6 +124,9 @@ def train_one_epoch(model: torch.nn.Module,
             log_writer.add_scalar('train_acc', train_acc_reduce, epoch_1000x)
             if bt_loss is not None:
                 log_writer.add_scalar('train_loss_bt', loss_bt_value_reduce, epoch_1000x)
+            if on_diag is not None:
+                log_writer.add_scalar("bt_on_diag", on_diag_value_reduce, epoch_1000x)
+                log_writer.add_scalar("bt_off_diag", off_diag_value_reduce, epoch_1000x)
 
             log_writer.add_scalar('lr', lr, epoch_1000x)
         # break

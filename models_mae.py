@@ -78,29 +78,43 @@ class MaskedAutoencoderViT(nn.Module):
         self.bt_variant = bt_variant
         self.bt_lambda = bt_lambda
         self.bt_weight = bt_weight
-
-        self.fixed_mask1, self.fixed_ids_restore1 = self._make_fixed_mask()
-        self.fixed_mask2, self.fixed_ids_restore2 = self._make_fixed_mask()
+        
+        self.fixed_mask1, self.fixed_ids_restore1, \
+        self.fixed_mask2, self.fixed_ids_restore2 = self._make_two_orthogonal_masks()
     
-    def _make_fixed_mask(self):
+    def _make_two_orthogonal_masks(self):
         L = self.patch_embed.num_patches
         len_keep = int(L * (1 - 0.75))
+
         noise = torch.rand(L)
+        ids_sorted = torch.argsort(noise)
 
-        ids_shuffle = torch.argsort(noise)
-        ids_restore = torch.argsort(ids_shuffle)
+        # two disjoint sets
+        ids_keep_1 = ids_sorted[:len_keep]
+        ids_keep_2 = ids_sorted[len_keep:2*len_keep]
 
-        mask = torch.ones(L)
-        mask[:len_keep] = 0
+        # --- mask1 ---
+        mask1 = torch.ones(L)
+        mask1[ids_keep_1] = 0
+        ids_restore1 = torch.argsort(torch.argsort(noise))
 
-        mask = mask[ids_restore]
+        mask1 = mask1[ids_restore1]
 
-        return mask, ids_restore
+        # --- mask2 ---
+        mask2 = torch.ones(L)
+        mask2[ids_keep_2] = 0
+        ids_restore2 = ids_restore1.clone()
+
+        mask2 = mask2[ids_restore2]
+
+        return mask1, ids_restore1, mask2, ids_restore2
     
     def compute_bt_loss_per_image(self, latent):
         B, N, d = latent.shape
 
         bt_losses = []
+        on_diags = []
+        off_diags = []
         for z_img in latent:
             z_tokens = z_img[1:]
             z_img = F.normalize(z_tokens, dim=-1)
@@ -110,9 +124,16 @@ class MaskedAutoencoderViT(nn.Module):
             on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
             off_diag = off_diagonal(c).pow_(2).sum()
 
-            bt_losses.append(on_diag + self.bt_lambda * off_diag)
+            on_diags.append(on_diag)
+            off_diags.append(off_diag)
 
-        return torch.stack(bt_losses).mean()
+            bt_losses.append(on_diag + self.bt_lambda * off_diag)
+        
+        bt_loss = torch.stack(bt_losses).mean()
+        on_diag_mean = torch.stack(on_diags).mean()
+        off_diag_mean = torch.stack(off_diags).mean()
+
+        return bt_loss, on_diag_mean, off_diag_mean
 
     def compute_bt_loss_per_batch(self, latent):
         B, N, d = latent.shape
@@ -125,8 +146,10 @@ class MaskedAutoencoderViT(nn.Module):
         # c = torch.clamp(c, -1.0, 1.0)
         on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
         off_diag = off_diagonal(c).pow_(2).sum()
+        
+        bt_loss = on_diag + self.bt_lambda * off_diag
 
-        return on_diag + self.bt_lambda * off_diag
+        return bt_loss, on_diag, off_diag
 
     def initialize_weights(self):
         # initialization
@@ -306,10 +329,12 @@ class MaskedAutoencoderViT(nn.Module):
         mae_loss = self.forward_loss(imgs, pred, mask)
         
         bt_loss = None
+        on_diag = None
+        off_diag = None
         if self.bt_variant == "per_image":
-            bt_loss = self.compute_bt_loss_per_image(latent)
+            bt_loss, on_diag, off_diag = self.compute_bt_loss_per_image(latent)
         elif self.bt_variant == "per_batch":
-            bt_loss = self.compute_bt_loss_per_batch(latent)
+            bt_loss, on_diag, off_diag = self.compute_bt_loss_per_batch(latent)
 
         total_loss = mae_loss + (self.bt_weight * bt_loss if bt_loss is not None else 0.0)
         
@@ -326,6 +351,8 @@ class MaskedAutoencoderViT(nn.Module):
             "loss": total_loss,
             "mae_loss": mae_loss,
             "bt_loss": bt_loss,
+            "on_diag": on_diag,
+            "off_diag": off_diag,
             "pred": pred,
             "mask": mask,
             "cls_feats": cls_feats,

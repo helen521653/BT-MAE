@@ -26,7 +26,7 @@ import torchvision.datasets as datasets
 import torch.distributed as dist
 
 from torch.utils.data import Dataset
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 
 import sys
 
@@ -200,8 +200,11 @@ def main(args):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     
     if args.use_hf_dataset:
-        ds_train = load_dataset("ilee0022/ImageNet100", split='train')
-        ds_val = load_dataset("ilee0022/ImageNet100", split='validation')
+        ds_train_train = load_dataset("ilee0022/ImageNet100", split='train')
+        ds_train_val = load_dataset("ilee0022/ImageNet100", split='validation')
+        
+        ds_train = concatenate_datasets([ds_train_train, ds_train_val])
+        ds_val = load_dataset("ilee0022/ImageNet100", split='test')
         
         dataset_train = HuggingFaceDataset(ds_train, transform=transform_train)
         dataset_val = HuggingFaceDataset(ds_val, transform=transform_val)
@@ -333,7 +336,7 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir and epoch + 1 == args.epochs and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
@@ -344,7 +347,7 @@ def main(args):
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
         
-        if (epoch + 1) % 5 == 0 and is_main_process():
+        if (epoch + 1) % 10 == 0 and is_main_process():
             compute_and_log_mi(
                 model,
                 val_loader_main_proc,

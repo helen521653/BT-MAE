@@ -55,7 +55,7 @@ import models_vit
 from engine_finetune import train_one_epoch, evaluate
 
 from torch.utils.data import Dataset
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 
 import numpy as np
 # --- Fix for deprecated NumPy aliases (np.float, np.int, etc.) ---
@@ -191,11 +191,11 @@ def main(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
     if args.use_hf_dataset:
-        ds_train = load_dataset("ilee0022/ImageNet100", split='train')
-        if args.eval:
-            ds_val = load_dataset("ilee0022/ImageNet100", split='test')
-        else:
-            ds_val = load_dataset("ilee0022/ImageNet100", split='validation')
+        ds_train_train = load_dataset("ilee0022/ImageNet100", split='train')
+        ds_train_val = load_dataset("ilee0022/ImageNet100", split='validation')
+        
+        ds_train = concatenate_datasets([ds_train_train, ds_train_val])
+        ds_val = load_dataset("ilee0022/ImageNet100", split='test')
         
         dataset_train = HuggingFaceDataset(ds_train, transform=transform_train)
         dataset_val = HuggingFaceDataset(ds_val, transform=transform_val)
@@ -345,10 +345,7 @@ def main(args):
 
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        if test_stats["acc1"] > max_accuracy:
-            max_accuracy = test_stats["acc1"]
-            best_model = copy.deepcopy(model_without_ddp)  # use model_without_ddp (not DDP wrapper)
-            print(f"New best model found at epoch {epoch}, acc1={max_accuracy:.2f}")
+        max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'Max accuracy: {max_accuracy:.2f}%')
 
         if log_writer is not None:
@@ -371,28 +368,9 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
     
-    if args.eval_test:
-        print("\n\nRunning evaluation on test set using best model")
-
-        best_model.to(device)
-        best_model.eval()
-
-        ds_test = load_dataset("ilee0022/ImageNet100", split='test')
-        dataset_test = HuggingFaceDataset(ds_test, transform=transform_val)
-        sampler_test = torch.utils.data.DistributedSampler(
-            dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test, sampler=sampler_test,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False
-        )
-
-        final_test_stats = evaluate(data_loader_test, best_model, device)
-        print(f"Accuracy of the best model on {len(dataset_test)} test images: "
-            f"{final_test_stats['acc1']:.1f}%")
+    if misc.is_main_process():
+        with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+            f.write(f"Accuracy@1 of the best model on test images: {max_accuracy}\n")
         
 
 if __name__ == '__main__':
