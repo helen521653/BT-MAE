@@ -25,6 +25,14 @@ def off_diagonal(x):
     assert n == m
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
+def off_diagonal_batched(x):
+    b, n, m = x.shape
+    assert n == m
+    x = x.contiguous().view(-1, n * n)
+    y = x[:, :-1].view(-1, n - 1, n + 1)[:, :, 1:]
+    y = y.reshape(-1, n * (n - 1))
+    return y.view(b, n * (n - 1))
+
 
 class MaskedAutoencoderViT(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
@@ -78,6 +86,7 @@ class MaskedAutoencoderViT(nn.Module):
         self.bt_variant = bt_variant
         self.bt_lambda = bt_lambda
         self.bt_weight = bt_weight
+        self.bt_eps = 1e-5
         
         self.fixed_mask1, self.fixed_ids_restore1, \
         self.fixed_mask2, self.fixed_ids_restore2 = self._make_two_orthogonal_masks()
@@ -110,30 +119,60 @@ class MaskedAutoencoderViT(nn.Module):
         return mask1, ids_restore1, mask2, ids_restore2
     
     def compute_bt_loss_per_image(self, latent):
-        B, N, d = latent.shape
-
+        z = latent  # (B, N, d)
+        n_patches = z.shape[1]
         bt_losses = []
-        on_diags = []
-        off_diags = []
-        for z_img in latent:
-            z_tokens = z_img[1:]
-            z_img = F.normalize(z_tokens, dim=-1)
-            z_img = (z_img - z_img.mean(0)) / (z_img.std(0) + 1e-6)
+        z = (z - z.mean(dim=1, keepdim=True)) / (z.std(1, keepdim=True) + self.bt_eps)
+        cov = z.transpose(1, 2).matmul(z) / n_patches
+        diag = cov.diagonal(dim1=1, dim2=2)
+        on_diag = ((diag - 1.0) ** 2).sum(-1)
+        off_diag = off_diagonal_batched(cov).pow_(2).sum(-1)
+        bt_losses = on_diag + self.bt_lambda * off_diag
+        bt_terms = (on_diag.mean(), off_diag.mean())
+        return bt_losses.mean(), bt_terms
+    
+    # compute_bt_loss_cross  cross corr embeddings z = mask1(x), z' = mask2(x)
+    def compute_bt_loss_cross(self, z1, z2):
+        B, N, d = z1.shape
 
-            c = (z_img.T @ z_img) / N
-            on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-            off_diag = off_diagonal(c).pow_(2).sum()
-
-            on_diags.append(on_diag)
-            off_diags.append(off_diag)
-
-            bt_losses.append(on_diag + self.bt_lambda * off_diag)
+        z1_norm = (z1 - z1.mean(dim=1, keepdim=True)) / (z1.std(dim=1, keepdim=True) + self.bt_eps)
+        z2_norm = (z2 - z2.mean(dim=1, keepdim=True)) / (z2.std(dim=1, keepdim=True) + self.bt_eps)
         
-        bt_loss = torch.stack(bt_losses).mean()
-        on_diag_mean = torch.stack(on_diags).mean()
-        off_diag_mean = torch.stack(off_diags).mean()
+        cov = torch.bmm(z1_norm.transpose(1, 2), z2_norm) / N  # (B, d, d)
+        
+        diag = torch.diagonal(cov, dim1=1, dim2=2)  # (B, d)
+        on_diag = ((diag - 1.0) ** 2).sum(dim=1)  # (B,)
+        off_diag = (cov ** 2).sum(dim=(1,2)) - (diag ** 2).sum(dim=1)  # (B,)
+        
+        bt_losses = on_diag + self.bt_lambda * off_diag
+        bt_terms = (on_diag.mean(), off_diag.mean())
+        return bt_losses.mean(), bt_terms
+    
+    # def compute_bt_loss_per_image(self, latent):
+    #     B, N, d = latent.shape
 
-        return bt_loss, on_diag_mean, off_diag_mean
+    #     bt_losses = []
+    #     on_diags = []
+    #     off_diags = []
+    #     for z_img in latent:
+    #         z_tokens = z_img[1:]
+    #         z_img = F.normalize(z_tokens, dim=-1)
+    #         z_img = (z_img - z_img.mean(0)) / (z_img.std(0) + 1e-6)
+
+    #         c = (z_img.T @ z_img) / N
+    #         on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+    #         off_diag = off_diagonal(c).pow_(2).sum()
+
+    #         on_diags.append(on_diag)
+    #         off_diags.append(off_diag)
+
+    #         bt_losses.append(on_diag + self.bt_lambda * off_diag)
+        
+    #     bt_loss = torch.stack(bt_losses).mean()
+    #     on_diag_mean = torch.stack(on_diags).mean()
+    #     off_diag_mean = torch.stack(off_diags).mean()
+
+    #     return bt_loss, on_diag_mean, off_diag_mean
 
     def compute_bt_loss_per_batch(self, latent):
         B, N, d = latent.shape
@@ -309,55 +348,96 @@ class MaskedAutoencoderViT(nn.Module):
         return loss
 
     def forward(self, imgs, mask_ratio=0.75, mask=None, mi_view=None):
-        if mi_view is not None:
-            if mi_view == 1:
-                mask = self.fixed_mask1.to(imgs.device).expand(imgs.size(0), -1)
-                ids_restore = self.fixed_ids_restore1.to(imgs.device).expand(imgs.size(0), -1)
-            elif mi_view == 2:
-                mask = self.fixed_mask2.to(imgs.device).expand(imgs.size(0), -1)
-                ids_restore = self.fixed_ids_restore2.to(imgs.device).expand(imgs.size(0), -1)
+        # cross-corr between two ortogonal masks
+        if self.bt_variant == "per_image_cross":
+            mask1 = self.fixed_mask1.to(imgs.device).expand(imgs.size(0), -1)
+            ids_restore1 = self.fixed_ids_restore1.to(imgs.device).expand(imgs.size(0), -1)
+            mask2 = self.fixed_mask2.to(imgs.device).expand(imgs.size(0), -1)
+            ids_restore2 = self.fixed_ids_restore2.to(imgs.device).expand(imgs.size(0), -1)
+            
+            latent1, mask1_out, ids_restore1_out = self.forward_encoder(
+                imgs, mask_ratio, mask=mask1, ids_restore=ids_restore1
+            )
+            latent2, mask2_out, ids_restore2_out = self.forward_encoder(
+                imgs, mask_ratio, mask=mask2, ids_restore=ids_restore2
+            )
+            
+            pred = self.forward_decoder(latent1, ids_restore1_out)
+            mae_loss = self.forward_loss(imgs, pred, mask1_out)
+            
+            bt_loss, (on_diag, off_diag) = self.compute_bt_loss_cross(latent1, latent2)
+            
+            if self.global_pool:
+                cls_feats = latent1[:, 1:, :].mean(dim=1)
+                cls_feats = self.fc_norm(cls_feats)
             else:
-                raise ValueError("mi_view must be 1, 2, or None")
-
-            latent, _, _ = self.forward_encoder(imgs, mask_ratio, mask=mask)
-            # override ids_restore after forward_encoder:
-            ids_restore = ids_restore
+                cls_feats = self.norm(latent1)
+                cls_feats = cls_feats[:, 0]
+            outputs = self.fc(cls_feats.detach())
+            
+            total_loss = mae_loss + self.bt_weight * bt_loss
+            
+            return {
+                "loss": total_loss,
+                "mae_loss": mae_loss,
+                "bt_loss": bt_loss,
+                "on_diag": on_diag,
+                "off_diag": off_diag,
+                "pred": pred,
+                "mask": mask1_out,
+                "cls_feats": cls_feats,
+                "outputs": outputs,
+            }
         else:
-            latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, mask=mask)
+            if mi_view is not None:
+                if mi_view == 1:
+                    mask = self.fixed_mask1.to(imgs.device).expand(imgs.size(0), -1)
+                    ids_restore = self.fixed_ids_restore1.to(imgs.device).expand(imgs.size(0), -1)
+                elif mi_view == 2:
+                    mask = self.fixed_mask2.to(imgs.device).expand(imgs.size(0), -1)
+                    ids_restore = self.fixed_ids_restore2.to(imgs.device).expand(imgs.size(0), -1)
+                else:
+                    raise ValueError("mi_view must be 1, 2, or None")
 
-        pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
-        mae_loss = self.forward_loss(imgs, pred, mask)
-        
-        bt_loss = None
-        on_diag = None
-        off_diag = None
-        if self.bt_variant == "per_image":
-            bt_loss, on_diag, off_diag = self.compute_bt_loss_per_image(latent)
-        elif self.bt_variant == "per_batch":
-            bt_loss, on_diag, off_diag = self.compute_bt_loss_per_batch(latent)
+                latent, _, _ = self.forward_encoder(imgs, mask_ratio, mask=mask)
+                # override ids_restore after forward_encoder:
+                ids_restore = ids_restore
+            else:
+                latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, mask=mask)
 
-        total_loss = mae_loss + (self.bt_weight * bt_loss if bt_loss is not None else 0.0)
-        
-        # get cls feature
-        if self.global_pool:
-            cls_feats = latent[:, 1:, :].mean(dim=1)  # global pool without cls token
-            cls_feats = self.fc_norm(cls_feats)
-        else:
-            cls_feats = self.norm(latent)
-            cls_feats = cls_feats[:, 0]
-        outputs = self.fc(cls_feats.detach())
+            pred = self.forward_decoder(latent, ids_restore)  # [N, L, p*p*3]
+            mae_loss = self.forward_loss(imgs, pred, mask)
+            
+            bt_loss = None
+            on_diag = None
+            off_diag = None
+            if self.bt_variant == "per_image":
+                bt_loss, on_diag, off_diag = self.compute_bt_loss_per_image(latent)
+            elif self.bt_variant == "per_batch":
+                bt_loss, on_diag, off_diag = self.compute_bt_loss_per_batch(latent)
 
-        return {
-            "loss": total_loss,
-            "mae_loss": mae_loss,
-            "bt_loss": bt_loss,
-            "on_diag": on_diag,
-            "off_diag": off_diag,
-            "pred": pred,
-            "mask": mask,
-            "cls_feats": cls_feats,
-            "outputs": outputs,
-        }
+            total_loss = mae_loss + (self.bt_weight * bt_loss if bt_loss is not None else 0.0)
+            
+            # get cls feature
+            if self.global_pool:
+                cls_feats = latent[:, 1:, :].mean(dim=1)  # global pool without cls token
+                cls_feats = self.fc_norm(cls_feats)
+            else:
+                cls_feats = self.norm(latent)
+                cls_feats = cls_feats[:, 0]
+            outputs = self.fc(cls_feats.detach())
+
+            return {
+                "loss": total_loss,
+                "mae_loss": mae_loss,
+                "bt_loss": bt_loss,
+                "on_diag": on_diag,
+                "off_diag": off_diag,
+                "pred": pred,
+                "mask": mask,
+                "cls_feats": cls_feats,
+                "outputs": outputs,
+            }
 
 
 def mae_vit_base_patch16_dec512d8b(**kwargs):
